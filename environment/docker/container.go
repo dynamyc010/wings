@@ -259,6 +259,11 @@ func (e *Environment) Create() error {
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}
 
+	// Let's set a OOM Score as well, for CGroupV2
+	if *hostConf.Resources.OomKillDisable {
+		hostConf.OomScoreAdj = -1000
+	}
+
 	if _, err := e.client.ContainerCreate(ctx, conf, hostConf, nil, nil, e.Id); err != nil {
 		return errors.Wrap(err, "environment/docker: failed to create container")
 	}
