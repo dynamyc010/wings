@@ -90,7 +90,36 @@ func (fs *UnixFS) Chmodat(dirfd int, name string, mode FileMode) error {
 }
 
 func (fs *UnixFS) fchmodat(op string, dirfd int, name string, mode FileMode) error {
-	return ensurePathError(unix.Fchmodat(dirfd, name, uint32(mode), 0), op, name)
+	err := unix.Fchmodat(dirfd, name, uint32(mode), AT_SYMLINK_NOFOLLOW)
+	if err == unix.EOPNOTSUPP {
+		// Kernels before 6.6 do not support fchmodat2, which is needed to pass
+		// AT_SYMLINK_NOFOLLOW.
+		err = fchmodNoFollow(dirfd, name, uint32(mode))
+	}
+	return ensurePathError(err, op, name)
+}
+
+// fchmodNoFollow changes the mode of name without following it if it is a
+// symbolic link, without needing fchmodat2.
+func fchmodNoFollow(dirfd int, name string, mode uint32) error {
+	fd, err := unix.Openat(dirfd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	// Linux does not support changing the mode of a symbolic link.
+	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return unix.EOPNOTSUPP
+	}
+	// The descriptor was opened with O_PATH, which fchmod does not accept, so
+	// change the mode through its entry in /proc, which refers to the file that
+	// was opened.
+	return unix.Chmod("/proc/self/fd/"+strconv.Itoa(fd), mode)
 }
 
 // Chown changes the numeric uid and gid of the named file.
@@ -170,8 +199,7 @@ func (fs *UnixFS) Chtimesat(dirfd int, name string, atime, mtime time.Time) erro
 	set(0, atime)
 	set(1, mtime)
 
-	// This does support `AT_SYMLINK_NOFOLLOW` as well if needed.
-	return ensurePathError(unix.UtimesNanoAt(dirfd, name, utimes[0:], 0), "chtimes", name)
+	return ensurePathError(unix.UtimesNanoAt(dirfd, name, utimes[0:], AT_SYMLINK_NOFOLLOW), "chtimes", name)
 }
 
 // Create creates or truncates the named file. If the file already exists,
@@ -207,17 +235,17 @@ func (fs *UnixFS) mkdirat(op string, dirfd int, name string, mode FileMode) erro
 }
 
 // MkdirAll creates a directory named path, along with any necessary
-// parents, and returns nil, or else returns an error.
+// parents, and returns the directories it created, or else returns an error.
 //
-// The permission bits perm (before umask) are used for all
-// directories that MkdirAll creates.
-// If path is already a directory, MkdirAll does nothing
-// and returns nil.
-func (fs *UnixFS) MkdirAll(name string, mode FileMode) error {
+// The returned directories are ordered from shallowest to deepest. The
+// permission bits perm (before umask) are used for all directories that
+// MkdirAll creates. If path is already a directory, MkdirAll does nothing and
+// returns no created directories.
+func (fs *UnixFS) MkdirAll(name string, mode FileMode) ([]string, error) {
 	// Ensure name is somewhat clean before continuing.
 	name, err := fs.unsafePath(name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return fs.mkdirAll(name, mode)
 }
@@ -471,7 +499,7 @@ func (fs *UnixFS) Rename(oldpath, newpath string) error {
 		if !errors.As(err, &pathErr) {
 			return err
 		}
-		if err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
+		if _, err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
 			return err
 		}
 		newdirfd, newname, closeFd2, err = fs.safePath(newpath)
@@ -511,17 +539,46 @@ func (fs *UnixFS) Rename(oldpath, newpath string) error {
 	return nil
 }
 
-// Stat returns a FileInfo describing the named file.
+// Stat returns a FileInfo describing the named file. If the file is a symbolic
+// link, the file it refers to is described, as long as that file is inside the
+// filesystem.
 //
 // If there is an error, it will be of type *PathError.
 func (fs *UnixFS) Stat(name string) (FileInfo, error) {
-	return fs._fstat("stat", name, 0)
+	info, err := fs.Lstat(name)
+	if err != nil || info.Mode()&ModeSymlink == 0 {
+		return info, err
+	}
+	return fs.statFollow(name)
 }
 
-// Statat is like Stat but allows passing an existing directory file
-// descriptor rather than needing to resolve one.
-func (fs *UnixFS) Statat(dirfd int, name string) (FileInfo, error) {
-	return fs._fstatat("statat", dirfd, name, 0)
+// statFollow describes the file the symbolic link name refers to, resolving the
+// link from the root of the filesystem so that it cannot lead outside of it.
+func (fs *UnixFS) statFollow(name string) (FileInfo, error) {
+	rel, err := fs.unsafePath(name)
+	if err != nil {
+		return nil, err
+	}
+	rootfd, err := fs._openat(AT_EMPTY_PATH, fs.basePath, O_DIRECTORY|O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootfd)
+
+	fd, err := fs.openatResolved(rootfd, rel, unix.O_PATH, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+
+	var s fileStat
+	if err := ignoringEINTR(func() error {
+		return unix.Fstat(fd, &s.sys)
+	}); err != nil {
+		return nil, ensurePathError(err, "stat", name)
+	}
+	fillFileStatFromSys(&s, filepath.Base(rel))
+	return &s, nil
 }
 
 // Lstat returns a FileInfo describing the named file.
@@ -534,14 +591,30 @@ func (fs *UnixFS) Lstat(name string) (FileInfo, error) {
 	return fs._fstat("lstat", name, AT_SYMLINK_NOFOLLOW)
 }
 
+// Readlinkat returns the target of the symbolic link name in the directory
+// dirfd.
+func (fs *UnixFS) Readlinkat(dirfd int, name string) (string, error) {
+	for size := 256; ; size *= 2 {
+		b := make([]byte, size)
+		var n int
+		err := ignoringEINTR(func() error {
+			var err error
+			n, err = unix.Readlinkat(dirfd, name, b)
+			return err
+		})
+		if err != nil {
+			return "", ensurePathError(err, "readlinkat", name)
+		}
+		if n < size {
+			return string(b[:n]), nil
+		}
+	}
+}
+
 // Lstatat is like Lstat but allows passing an existing directory file
 // descriptor rather than needing to resolve one.
 func (fs *UnixFS) Lstatat(dirfd int, name string) (FileInfo, error) {
 	return fs._fstatat("lstatat", dirfd, name, AT_SYMLINK_NOFOLLOW)
-}
-
-func (fs *UnixFS) fstat(name string, flags int) (FileInfo, error) {
-	return fs._fstat("fstat", name, flags)
 }
 
 func (fs *UnixFS) _fstat(op string, name string, flags int) (FileInfo, error) {
@@ -551,10 +624,6 @@ func (fs *UnixFS) _fstat(op string, name string, flags int) (FileInfo, error) {
 		return nil, err
 	}
 	return fs._fstatat(op, dirfd, name, flags)
-}
-
-func (fs *UnixFS) fstatat(dirfd int, name string, flags int) (FileInfo, error) {
-	return fs._fstatat("fstatat", dirfd, name, flags)
 }
 
 func (fs *UnixFS) _fstatat(op string, dirfd int, name string, flags int) (FileInfo, error) {
@@ -623,7 +692,7 @@ func (fs *UnixFS) TouchPath(path string) (int, string, func(), error, bool) {
 	if !errors.As(err, &pathErr) {
 		return dirfd, name, closeFd, err, false
 	}
-	if err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
+	if _, err := fs.MkdirAll(pathErr.Path, 0o755); err != nil {
 		return dirfd, name, closeFd, err, false
 	}
 
@@ -659,6 +728,19 @@ func (fs *UnixFS) openat(dirfd int, name string, flag int, mode FileMode) (int, 
 	if flag&O_NOFOLLOW == 0 {
 		flag |= O_NOFOLLOW
 	}
+	return fs.openatResolved(dirfd, name, flag, mode)
+}
+
+// openatResolved is openat without O_NOFOLLOW being added, so that a symbolic
+// link as the last element of name is followed. Any symbolic link must still
+// resolve to a path beneath dirfd.
+func (fs *UnixFS) openatResolved(dirfd int, name string, flag int, mode FileMode) (int, error) {
+	// Open everything without blocking and refuse anything that is not a regular
+	// file or a directory. Paths opened with O_PATH are never read or written.
+	checkType := flag&unix.O_PATH == 0
+	if checkType {
+		flag |= unix.O_NONBLOCK
+	}
 
 	var fd int
 	for {
@@ -678,6 +760,13 @@ func (fs *UnixFS) openat(dirfd int, name string, flag int, mode FileMode) (int, 
 		return 0, err
 	}
 
+	if checkType {
+		if err := checkOpenedType(fd, name); err != nil {
+			_ = unix.Close(fd)
+			return 0, err
+		}
+	}
+
 	// If we are using openat2, we don't need the additional security checks.
 	if fs.useOpenat2 {
 		return fd, nil
@@ -685,12 +774,23 @@ func (fs *UnixFS) openat(dirfd int, name string, flag int, mode FileMode) (int, 
 
 	// If we are not using openat2, do additional path checking. This assumes
 	// that openat2 is using `RESOLVE_BENEATH` to avoid the same security
-	// issue.
+	// issue. The file is closed if the check fails, since callers only use the
+	// file descriptor when there is no error.
+	if err := fs.checkOpenedPath(fd, name); err != nil {
+		_ = unix.Close(fd)
+		return 0, err
+	}
+	return fd, nil
+}
+
+// checkOpenedPath returns an error if the file opened as fd, without the
+// protection of openat2, resolved to a path outside of the filesystem.
+func (fs *UnixFS) checkOpenedPath(fd int, name string) error {
 	var finalPath string
 	finalPath, err := filepath.EvalSymlinks(filepath.Join("/proc/self/fd/", strconv.Itoa(fd)))
 	if err != nil {
 		if !errors.Is(err, ErrNotExist) {
-			return fd, fmt.Errorf("failed to evaluate symlink: %w", convertErrorType(err))
+			return fmt.Errorf("failed to evaluate symlink: %w", convertErrorType(err))
 		}
 
 		// The target of one of the symlinks (EvalSymlinks is recursive)
@@ -698,7 +798,7 @@ func (fs *UnixFS) openat(dirfd int, name string, flag int, mode FileMode) (int, 
 		// that for further validation instead.
 		var pErr *PathError
 		if !errors.As(err, &pErr) {
-			return fd, fmt.Errorf("failed to evaluate symlink: %w", convertErrorType(err))
+			return fmt.Errorf("failed to evaluate symlink: %w", convertErrorType(err))
 		}
 
 		// Update the final path to whatever directory or path didn't exist while
@@ -714,15 +814,31 @@ func (fs *UnixFS) openat(dirfd int, name string, flag int, mode FileMode) (int, 
 		if fs.useOpenat2 {
 			op = "openat2"
 		}
-		return fd, &PathError{
+		return &PathError{
 			Op:   op,
 			Path: name,
 			Err:  ErrBadPathResolution,
 		}
 	}
 
-	// Return the file descriptor and any potential error.
-	return fd, err
+	return err
+}
+
+// checkOpenedType returns an error if the file descriptor opened without
+// blocking is not a regular file or a directory, and otherwise switches it back
+// to blocking mode.
+func checkOpenedType(fd int, name string) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return convertErrorType(&PathError{Op: "fstat", Path: name, Err: err})
+	}
+	if t := st.Mode & unix.S_IFMT; t != unix.S_IFREG && t != unix.S_IFDIR {
+		return &PathError{Op: "openat", Path: name, Err: ErrNotRegular}
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		return convertErrorType(&PathError{Op: "fcntl", Path: name, Err: err})
+	}
+	return nil
 }
 
 // _openat is a wrapper around unix.Openat. This method should never be directly
@@ -736,12 +852,12 @@ func (fs *UnixFS) _openat(dirfd int, name string, flag int, mode uint32) (int, e
 	}
 	// O_LARGEFILE is set by Openat for us automatically.
 	fd, err := unix.Openat(dirfd, name, flag, mode)
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		return fd, nil
-	case err == unix.EINTR:
+	case unix.EINTR:
 		return fd, err
-	case err == unix.EAGAIN:
+	case unix.EAGAIN:
 		return fd, err
 	default:
 		return fd, ensurePathError(err, "openat", name)
@@ -775,12 +891,12 @@ func (fs *UnixFS) _openat2(dirfd int, name string, flag, mode uint64) (int, erro
 		// This is why using Openat2 over Openat is preferred if available.
 		Resolve: unix.RESOLVE_BENEATH,
 	})
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		return fd, nil
-	case err == unix.EINTR:
+	case unix.EINTR:
 		return fd, err
-	case err == unix.EAGAIN:
+	case unix.EAGAIN:
 		return fd, err
 	default:
 		return fd, ensurePathError(err, "openat2", name)
